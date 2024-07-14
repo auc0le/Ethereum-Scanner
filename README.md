@@ -42,7 +42,7 @@ The script can be run in four different modes:
 
 ### Basic Usage
 
-python Code.py <mode> [--processes <num_processes>]
+python CPU-Windows.py <mode> [--processes <num_processes>]
 
 Where <mode> is one of: infura, etherscan, alchemy, or target.
 
@@ -51,16 +51,16 @@ The --processes argument is optional and only applicable in target mode. It spec
 ### Mode Descriptions
 
 1. Infura Mode: Generates random Ethereum addresses and checks their balance using the Infura API.
-   ```python Code.py infura```
+   ```python CPU-Windows.py infura```
 
 2. Etherscan Mode: Generates random Ethereum addresses in batches and checks their balances using the Etherscan API.
-   ```python Code.py etherscan```
+   ```python CPU-Windows.py etherscan```
 
 3. Alchemy Mode: Similar to Infura mode, but uses the Alchemy API for balance checks.
-   ```python Code.py alchemy```
+   ```python CPU-Windows.py alchemy```
 
 4. Target Mode: Reads target addresses from target.csv and attempts to find collisions by generating random addresses.
-   ```python Code.py target --processes 4```
+   ```python CPU-Windows.py target --processes 4```
 
 ## Configuration
 
