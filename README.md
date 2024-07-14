@@ -21,11 +21,15 @@ This project is a proof-of-concept security scanner for Ethereum addresses. It d
 Installation
 
 1. Clone this repository:
+   ```
    git https://github.com/auc0le/Ethereum-Scanner.git
    cd ethereum-balance-checker
+   ```
 
 2. Install the required libraries:
+   ```
    pip install web3 requests eth-account colorama portalocker
+   ```
 
 ## Usage
 
@@ -47,20 +51,20 @@ The --processes argument is optional and only applicable in target mode. It spec
 ### Mode Descriptions
 
 1. Infura Mode: Generates random Ethereum addresses and checks their balance using the Infura API.
-   python Code.py infura
+   ```python Code.py infura```
 
 2. Etherscan Mode: Generates random Ethereum addresses in batches and checks their balances using the Etherscan API.
-   python Code.py etherscan
+   ```python Code.py etherscan```
 
 3. Alchemy Mode: Similar to Infura mode, but uses the Alchemy API for balance checks.
-   python Code.py alchemy
+   ```python Code.py alchemy```
 
 4. Target Mode: Reads target addresses from target.csv and attempts to find collisions by generating random addresses.
-   python Code.py target --processes 4
+   ```python Code.py target --processes 4```
 
 ## Configuration
 
-- API keys are stored in the API_KEYS dictionary in the script. Replace these with your own API keys.
+- API keys are stored in the API_KEYS dictionary in the script. **Replace these with your own API keys**.
 - The target.csv file should contain a list of Ethereum addresses to check against in Target mode.
 
 ## Output
