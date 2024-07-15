@@ -59,15 +59,19 @@ The --target-file argument is optional and only applicable in target mode.  It a
 ### Mode Descriptions
 
 1. Infura Mode: Generates random Ethereum addresses and checks their balance using the Infura API.
+
    ```python CPU-Windows.py infura```
 
 2. Etherscan Mode: Generates random Ethereum addresses in batches and checks their balances using the Etherscan API.
+
    ```python CPU-Windows.py etherscan```
 
 3. Alchemy Mode: Similar to Infura mode, but uses the Alchemy API for balance checks.
+
    ```python CPU-Windows.py alchemy```
 
 4. Target Mode: Reads target addresses from target.csv and attempts to find collisions by generating random addresses.
+
    ```python CPU-Windows.py target --processes 4```
 
 ## Configuration
