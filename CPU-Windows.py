@@ -1,4 +1,3 @@
-# Standard library imports
 import os
 import csv
 import time
@@ -6,115 +5,58 @@ import json
 import argparse
 import sys
 import platform
-import secrets
-import hashlib
-import base58
-import multiprocessing
-import math
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
-# Third-party imports
-import requests
-import psutil
-import tqdm
+from typing import Set, Dict, Optional, List
 import portalocker
 import uuid
-import mmh3
-from bitarray import bitarray
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import requests
 from requests.exceptions import RequestException, Timeout, HTTPError
 from web3 import Web3
 from eth_account import Account
 from colorama import Fore, Style, init
+
+# New imports for faster Bitcoin address generation
+import hashlib
 from coincurve import PublicKey
 from coincurve.utils import int_to_bytes
+import base58
+import secrets
 
 # Initialize colorama for colored output
 init(autoreset=True)
 
 # API key constants
 API_KEYS = {
-    "INFURA": "",
-    "ETHERSCAN": "",
-    "ALCHEMY": ""
+    "INFURA": "INSERT API KEY HERE",
+    "ETHERSCAN": "INSERT API KEY HERE",
+    "ALCHEMY": "INSERT API KEY HERE"
 }
 
 # Configuration constants
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
 
-class BloomFilter:
-    def __init__(self, size, hash_count):
-        self.size = size
-        self.hash_count = hash_count
-        self.bit_array = bitarray(size)
-        self.bit_array.setall(0)
-
-    def add(self, item):
-        for seed in range(self.hash_count):
-            result = mmh3.hash(item, seed) % self.size
-            self.bit_array[result] = 1
-
-    def __contains__(self, item):
-        for seed in range(self.hash_count):
-            result = mmh3.hash(item, seed) % self.size
-            if self.bit_array[result] == 0:
-                return False
-        return True
-
-def process_chunk(chunk, size, hash_count, delimiter):
-    bloom_filter = BloomFilter(size, hash_count)
-    for line in chunk:
-        address = line.strip().split(delimiter)[0].lower()
-        if address:
-            bloom_filter.add(address)
-    return bloom_filter.bit_array
-
-def load_addresses_from_file(filename: str, crypto: str) -> BloomFilter:
-    # Estimate bloom filter size and hash count based on expected number of items
-    n = 50_000_000  # expected number of items
-    p = 0.01  # false positive probability
-    m = int(-(n * math.log(p)) / (math.log(2)**2))
-    k = int((m/n) * math.log(2))
-
-    bloom_filter = BloomFilter(m, k)
-
-    total_lines = sum(1 for _ in open(filename, 'r'))
-    file_size = os.path.getsize(filename)
-
-    # Check available RAM
-    available_ram = psutil.virtual_memory().available
-    estimated_ram_usage = file_size * 2  # Rough estimate, adjust if needed
-    if estimated_ram_usage > available_ram:
-        print(f"Warning: The file may be too large to fit in memory.")
-        print(f"Estimated RAM usage: {estimated_ram_usage / (1024**3):.2f} GB")
-        print(f"Available RAM: {available_ram / (1024**3):.2f} GB")
-        response = input("Do you want to continue? (y/n): ")
-        if response.lower() != 'y':
-            sys.exit(1)
-
-    # Determine the file format (CSV or TSV)
-    file_extension = os.path.splitext(filename)[1].lower()
-    delimiter = '\t' if file_extension == '.tsv' else ','
-
-    # Read the file and split it into chunks
-    with open(filename, 'r') as file:
-        lines = file.readlines()
-
-    # Determine the number of processes to use
-    num_processes = multiprocessing.cpu_count()
-    chunk_size = len(lines) // num_processes
-    chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
-
-    # Process chunks in parallel
-    with ProcessPoolExecutor(max_workers=num_processes) as executor:
-        futures = [executor.submit(process_chunk, chunk, m, k, delimiter) for chunk in chunks]
-        for future in tqdm.tqdm(as_completed(futures), total=len(futures), desc="Loading addresses"):
-            bloom_filter.bit_array |= future.result()
-
-    print(f"Loaded approximately {n:,} addresses into Bloom filter")
-    return bloom_filter
+def load_addresses_from_file(filename: str) -> Set[str]:
+    addresses = set()
+    try:
+        with open(filename, 'r') as file:
+            addresses = {line.strip().lower() for line in file if line.strip()}
+        print(f"Loaded {len(addresses):,} unique addresses from {filename}")
+    except FileNotFoundError:
+        print(f"Error: File {filename} not found.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: An error occurred while reading the file: {e}")
+        sys.exit(1)
+    
+    if not addresses:
+        print(f"Error: No valid addresses found in {filename}")
+        sys.exit(1)
+    
+    return addresses
 
 def append_to_csv(filename: str, data: List):
     file_exists = os.path.isfile(filename)
@@ -167,7 +109,7 @@ def generate_ethereum_addresses(num_addresses=1):
         addresses.append((private_key, account.address.lower()))
     return addresses if num_addresses > 1 else addresses[0]
 
-def process_batch(batch_size: int, target_addresses: BloomFilter, shared_dict: Dict, crypto: str, batch_number: int) -> Optional[List[tuple]]:
+def process_batch(batch_size: int, target_addresses: Set[str], shared_dict: Dict, crypto: str, batch_number: int) -> Optional[List[tuple]]:
     found_matches = []
 
     if crypto == 'ethereum':
@@ -222,7 +164,7 @@ class CryptoBalanceChecker:
         if mode == 'target':
             if target_file is None:
                 target_file = 'eth-target.csv' if crypto == 'ethereum' else 'btc-target.csv'
-            self.target_addresses = load_addresses_from_file(target_file, crypto)
+            self.target_addresses = load_addresses_from_file(target_file)
         else:
             self.w3 = Web3(Web3.HTTPProvider(f"https://mainnet.infura.io/v3/{API_KEYS['INFURA']}"))
 
@@ -377,7 +319,7 @@ class CryptoBalanceChecker:
         elif self.mode == 'etherscan':
             while True:
                 accounts = [Account.create() for _ in range(20)]
-                addresses = [account.address for account in accounts]
+                addresses = [account.address for account in addresses]
                 balances = self.get_balance_etherscan(addresses)
                 for account, address in zip(accounts, addresses):
                     if self.process_address(account._private_key.hex(), address):
@@ -395,7 +337,7 @@ def main():
     parser.add_argument("mode", choices=['infura', 'etherscan', 'alchemy', 'target'], help="Mode to run the balance check")
     parser.add_argument("--processes", type=int, default=multiprocessing.cpu_count(), help="Number of processes to use in target mode (default: number of CPU cores)")
     parser.add_argument("--crypto", choices=['ethereum', 'bitcoin'], default='ethereum', help="Cryptocurrency to use in target mode (default: ethereum)")
-    parser.add_argument("--target-file", help="Path to the target CSV or TSV file (only used in target mode)")
+    parser.add_argument("--target-file", help="Path to the target CSV file (only used in target mode)")
     args = parser.parse_args()
 
     num_processes = args.processes if args.mode == 'target' else 1
@@ -404,4 +346,4 @@ def main():
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()  # This is necessary for Windows compatibility
-    main()
+    main()                
