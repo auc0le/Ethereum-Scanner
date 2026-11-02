@@ -10,12 +10,14 @@ from typing import Set, Dict, Optional, List
 import portalocker
 import uuid
 import multiprocessing
+import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import requests
 from requests.exceptions import RequestException, Timeout, HTTPError
 from web3 import Web3
 from eth_account import Account
+from eth_hash.auto import keccak  # Keccak-256; provided by eth-hash (an eth-account dependency)
 from colorama import Fore, Style, init
 
 # New imports for faster Bitcoin address generation
@@ -104,50 +106,56 @@ def generate_bitcoin_addresses(num_addresses=1):
 def generate_ethereum_addresses(num_addresses=1):
     addresses = []
     for _ in range(num_addresses):
-        private_key = secrets.token_hex(32)
-        account = Account.from_key(private_key)
-        addresses.append((private_key, account.address.lower()))
+        # Raw 32 random bytes -> secp256k1 pubkey (coincurve, C) -> Keccak-256.
+        # Avoids eth_account.Account.from_key, which dominated the per-key cost.
+        private_key = secrets.token_bytes(32)
+        public_key = PublicKey.from_valid_secret(private_key).format(compressed=False)[1:]
+        address = '0x' + keccak(public_key)[-20:].hex()
+        addresses.append((private_key.hex(), address))
     return addresses if num_addresses > 1 else addresses[0]
 
-def process_batch(batch_size: int, target_addresses: Set[str], shared_dict: Dict, crypto: str, batch_number: int) -> Optional[List[tuple]]:
+# Per-worker state, populated once by the pool initializer so the (large)
+# target set is pickled to each worker a single time rather than on every task.
+_WORKER_TARGETS: Set[str] = set()
+_WORKER_CRYPTO: str = 'ethereum'
+
+
+def _init_worker(target_addresses: Set[str], crypto: str):
+    global _WORKER_TARGETS, _WORKER_CRYPTO
+    _WORKER_TARGETS = target_addresses
+    _WORKER_CRYPTO = crypto
+
+
+def process_batch(batch_size: int) -> tuple:
+    """Generate `batch_size` random keypairs; return (count_checked, matches).
+
+    Reads the target set / crypto from per-worker globals (see _init_worker)
+    and keeps no shared state in the hot loop -- the caller aggregates counts.
+    """
+    targets = _WORKER_TARGETS
+    generate = generate_ethereum_addresses if _WORKER_CRYPTO == 'ethereum' else generate_bitcoin_addresses
     found_matches = []
+    chunk_size = 10000
 
-    if crypto == 'ethereum':
-        chunk_size = 10000  # Increase chunk size for Ethereum
-        for i in range(0, batch_size, chunk_size):
-            current_chunk_size = min(chunk_size, batch_size - i)
-            addresses = generate_ethereum_addresses(current_chunk_size)
-            
-            shared_dict['addresses_checked'] += current_chunk_size
-            
-            for private_key, address in addresses:
-                if address in target_addresses:
-                    found_matches.append((private_key, address))
-    else:  # bitcoin
-        chunk_size = 10000  # Chunk size for Bitcoin
-        for i in range(0, batch_size, chunk_size):
-            current_chunk_size = min(chunk_size, batch_size - i)
-            addresses = generate_bitcoin_addresses(current_chunk_size)
-            
-            shared_dict['addresses_checked'] += current_chunk_size
-            
-            for private_key, address in addresses:
-                if address in target_addresses:
-                    found_matches.append((private_key, address))
+    for i in range(0, batch_size, chunk_size):
+        current_chunk_size = min(chunk_size, batch_size - i)
+        for private_key, address in generate(current_chunk_size):
+            if address in targets:
+                found_matches.append((private_key, address))
 
-    return found_matches if found_matches else None
+    return batch_size, (found_matches if found_matches else None)
 
 def format_time(seconds: int) -> str:
     return str(timedelta(seconds=seconds)).split('.')[0]
 
-def print_status(shared_dict, start_time, instance_id, stop_event, crypto):
+def print_status(counter, start_time, instance_id, stop_event, crypto):
     while not stop_event.is_set():
-        current_time = time.time()
-        elapsed_time = int(current_time - start_time)
+        elapsed_time = int(time.time() - start_time)
         formatted_time = format_time(elapsed_time)
-        addresses_per_second = shared_dict['addresses_checked'] / elapsed_time if elapsed_time > 0 else 0
+        checked = counter[0]
+        addresses_per_second = checked / elapsed_time if elapsed_time > 0 else 0
         crypto_colored = Fore.BLUE + "BITCOIN" + Style.RESET_ALL if crypto == 'bitcoin' else Fore.YELLOW + "ETHEREUM" + Style.RESET_ALL
-        status_message = f"Instance {instance_id} - Checked {shared_dict['addresses_checked']:,} {crypto_colored} addresses in {formatted_time} (Avg: {addresses_per_second:,.2f} addr/s)"
+        status_message = f"Instance {instance_id} - Checked {checked:,} {crypto_colored} addresses in {formatted_time} (Avg: {addresses_per_second:,.2f} addr/s)"
         print(f"\033[K{status_message}", end="\r", flush=True)
         time.sleep(1)
 
@@ -158,9 +166,6 @@ class CryptoBalanceChecker:
         self.crypto = crypto
         self.counter = 0
         self.instance_id = str(uuid.uuid4())[:8]
-        self.manager = multiprocessing.Manager()
-        self.shared_dict = self.manager.dict()
-        self.shared_dict['addresses_checked'] = 0
         if mode == 'target':
             if target_file is None:
                 target_file = 'eth-target.csv' if crypto == 'ethereum' else 'btc-target.csv'
@@ -275,29 +280,41 @@ class CryptoBalanceChecker:
         return False
 
     def run_target_mode(self):
-        batch_size = 100000  # Increased batch size for better performance
-        
-        stop_event = self.manager.Event()
+        batch_size = 100000  # Keys generated per task; tune for status cadence
+
         start_time = time.time()
+        counter = [0]  # running total: written by main thread, read by status thread
+        stop_event = threading.Event()
 
         # Print information about processes and CPU
         print(f"Running on {platform.processor()} with {multiprocessing.cpu_count()} cores")
         print(f"Using {self.num_processes} processes for address generation")
         print()  # Add an empty line
 
-        # Start the status printing process
-        status_process = multiprocessing.Process(target=print_status, args=(self.shared_dict, start_time, self.instance_id, stop_event, self.crypto))
-        status_process.start()
+        # Status runs as a thread in the main process, so it needs no
+        # cross-process shared state (works the same under Windows 'spawn'
+        # and WSL 'fork').
+        status_thread = threading.Thread(
+            target=print_status,
+            args=(counter, start_time, self.instance_id, stop_event, self.crypto),
+            daemon=True,
+        )
+        status_thread.start()
 
         try:
-            with ProcessPoolExecutor(max_workers=self.num_processes) as executor:
-                batch_number = 0
-                while True:  # This will make the process run indefinitely
-                    batch_number += 1
-                    futures = [executor.submit(process_batch, batch_size, self.target_addresses, self.shared_dict, self.crypto, batch_number) for _ in range(self.num_processes)]
-                    
+            # The target set is pickled to each worker once, via the initializer,
+            # instead of being re-sent with every task submission.
+            with ProcessPoolExecutor(
+                max_workers=self.num_processes,
+                initializer=_init_worker,
+                initargs=(self.target_addresses, self.crypto),
+            ) as executor:
+                while True:  # Run indefinitely until interrupted
+                    futures = [executor.submit(process_batch, batch_size) for _ in range(self.num_processes)]
+
                     for future in as_completed(futures):
-                        result = future.result()
+                        count, result = future.result()
+                        counter[0] += count
                         if result:
                             for private_key, address in result:
                                 print("\n" * 2)  # Add two empty lines
@@ -307,9 +324,8 @@ class CryptoBalanceChecker:
         except KeyboardInterrupt:
             print("\n\nStopping the process...")
         finally:
-            # Stop the status printing process
             stop_event.set()
-            status_process.join()
+            status_thread.join(timeout=2)
 
         print(f"\nInstance {self.instance_id} - Finished checking {self.crypto.upper()} addresses.")
 
