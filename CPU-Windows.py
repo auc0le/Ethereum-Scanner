@@ -41,11 +41,19 @@ API_KEYS = {
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
 
-def load_addresses_from_file(filename: str) -> Set[str]:
+def load_addresses_from_file(filename: str, crypto: str = 'ethereum') -> Set[str]:
     addresses = set()
     try:
-        with open(filename, 'r') as file:
-            addresses = {line.strip().lower() for line in file if line.strip()}
+        # utf-8-sig strips a leading BOM (the target files have one); .strip()
+        # does not, which otherwise leaves the first address unmatchable.
+        with open(filename, 'r', encoding='utf-8-sig') as file:
+            if crypto == 'ethereum':
+                # Ethereum addresses are hex, matched case-insensitively.
+                addresses = {line.strip().lower() for line in file if line.strip()}
+            else:
+                # Bitcoin addresses (base58 and bech32) are case-sensitive;
+                # lowercasing corrupts the target and blocks every match.
+                addresses = {line.strip() for line in file if line.strip()}
         print(f"Loaded {len(addresses):,} unique addresses from {filename}")
     except FileNotFoundError:
         print(f"Error: File {filename} not found.")
@@ -71,35 +79,86 @@ def append_to_csv(filename: str, data: List):
 def get_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def _hash160(data: bytes) -> bytes:
+    """RIPEMD-160(SHA-256(data))."""
+    rip = hashlib.new('ripemd160')
+    rip.update(hashlib.sha256(data).digest())
+    return rip.digest()
+
+
+def _b58check(payload: bytes) -> str:
+    """Base58Check-encode a payload (version byte + hash) with a 4-byte checksum."""
+    checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    return base58.b58encode(payload + checksum).decode('ascii')
+
+
+def _bech32_polymod(values: List[int]) -> int:
+    generator = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    chk = 1
+    for value in values:
+        top = chk >> 25
+        chk = (chk & 0x1ffffff) << 5 ^ value
+        for i in range(5):
+            chk ^= generator[i] if ((top >> i) & 1) else 0
+    return chk
+
+
+def _bech32_checksum(hrp: str, data: List[int], spec: str) -> List[int]:
+    const = 0x2bc830a3 if spec == 'bech32m' else 1
+    expanded = [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+    polymod = _bech32_polymod(expanded + data + [0, 0, 0, 0, 0, 0]) ^ const
+    return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+
+
+def _convertbits(data: bytes, frombits: int, tobits: int) -> List[int]:
+    """Regroup 8-bit bytes into 5-bit groups, padding the final group."""
+    acc = bits = 0
+    ret = []
+    maxv = (1 << tobits) - 1
+    for value in data:
+        acc = (acc << frombits) | value
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    if bits:
+        ret.append((acc << (tobits - bits)) & maxv)
+    return ret
+
+
+def _segwit_address(witver: int, witprog: bytes, hrp: str = 'bc') -> str:
+    spec = 'bech32' if witver == 0 else 'bech32m'
+    data = [witver] + _convertbits(witprog, 8, 5)
+    combined = data + _bech32_checksum(hrp, data, spec)
+    return hrp + '1' + ''.join(_BECH32_CHARSET[d] for d in combined)
+
+
 def generate_bitcoin_addresses(num_addresses=1):
+    # One random key maps to several address formats, and the target list mixes
+    # them, so we derive and check every single-key type: legacy P2PKH "1..."
+    # (compressed and uncompressed keys), nested SegWit P2SH-P2WPKH "3...", and
+    # native SegWit v0 P2WPKH "bc1q...". Multisig P2SH and P2WSH come from
+    # scripts, not a single key; taproot "bc1p" is single-key-derivable but
+    # omitted for now.
     addresses = []
     for _ in range(num_addresses):
-        # Generate a random private key
         private_key = os.urandom(32)
         private_key_hex = private_key.hex()
 
-        # Get the public key
-        public_key = PublicKey.from_valid_secret(private_key).format(compressed=True)
+        pk = PublicKey.from_valid_secret(private_key)
+        h160_compressed = _hash160(pk.format(compressed=True))
+        h160_uncompressed = _hash160(pk.format(compressed=False))
 
-        # Hash the public key using SHA-256 and RIPEMD-160
-        sha256_hash = hashlib.sha256(public_key).digest()
-        ripemd160 = hashlib.new('ripemd160')
-        ripemd160.update(sha256_hash)
-        hash160 = ripemd160.digest()
-
-        # Add version byte (0x00 for mainnet)
-        versioned_hash = b'\x00' + hash160
-
-        # Double SHA-256 hash for checksum
-        checksum = hashlib.sha256(hashlib.sha256(versioned_hash).digest()).digest()[:4]
-
-        # Combine versioned hash and checksum
-        binary_address = versioned_hash + checksum
-
-        # Base58 encode the result
-        address = base58.b58encode(binary_address).decode('utf-8')
-        
-        addresses.append((private_key_hex, address))
+        # P2PKH "1..." from the compressed and the uncompressed public key
+        addresses.append((private_key_hex, _b58check(b'\x00' + h160_compressed)))
+        addresses.append((private_key_hex, _b58check(b'\x00' + h160_uncompressed)))
+        # P2SH-P2WPKH "3...": hash160 of the witness program (OP_0 PUSH20 <h160>)
+        addresses.append((private_key_hex, _b58check(b'\x05' + _hash160(b'\x00\x14' + h160_compressed))))
+        # P2WPKH "bc1q...": native SegWit v0
+        addresses.append((private_key_hex, _segwit_address(0, h160_compressed)))
 
     return addresses if num_addresses > 1 else addresses[0]
 
@@ -127,23 +186,27 @@ def _init_worker(target_addresses: Set[str], crypto: str):
 
 
 def process_batch(batch_size: int) -> tuple:
-    """Generate `batch_size` random keypairs; return (count_checked, matches).
+    """Generate `batch_size` random keys; return (addresses_checked, matches).
 
-    Reads the target set / crypto from per-worker globals (see _init_worker)
-    and keeps no shared state in the hot loop -- the caller aggregates counts.
+    Bitcoin derives several address types per key, so addresses_checked can
+    exceed batch_size. Reads the target set / crypto from per-worker globals
+    (see _init_worker) and keeps no shared state in the hot loop.
     """
     targets = _WORKER_TARGETS
     generate = generate_ethereum_addresses if _WORKER_CRYPTO == 'ethereum' else generate_bitcoin_addresses
     found_matches = []
+    checked = 0
     chunk_size = 10000
 
     for i in range(0, batch_size, chunk_size):
         current_chunk_size = min(chunk_size, batch_size - i)
-        for private_key, address in generate(current_chunk_size):
+        generated = generate(current_chunk_size)
+        checked += len(generated)  # Bitcoin yields several addresses per key
+        for private_key, address in generated:
             if address in targets:
                 found_matches.append((private_key, address))
 
-    return batch_size, (found_matches if found_matches else None)
+    return checked, (found_matches if found_matches else None)
 
 def format_time(seconds: int) -> str:
     return str(timedelta(seconds=seconds)).split('.')[0]
@@ -169,7 +232,7 @@ class CryptoBalanceChecker:
         if mode == 'target':
             if target_file is None:
                 target_file = 'eth-target.csv' if crypto == 'ethereum' else 'btc-target.csv'
-            self.target_addresses = load_addresses_from_file(target_file)
+            self.target_addresses = load_addresses_from_file(target_file, crypto)
         else:
             self.w3 = Web3(Web3.HTTPProvider(f"https://mainnet.infura.io/v3/{API_KEYS['INFURA']}"))
 
@@ -335,7 +398,7 @@ class CryptoBalanceChecker:
         elif self.mode == 'etherscan':
             while True:
                 accounts = [Account.create() for _ in range(20)]
-                addresses = [account.address for account in addresses]
+                addresses = [account.address for account in accounts]
                 balances = self.get_balance_etherscan(addresses)
                 for account, address in zip(accounts, addresses):
                     if self.process_address(account._private_key.hex(), address):
