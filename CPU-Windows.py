@@ -136,13 +136,18 @@ def _segwit_address(witver: int, witprog: bytes, hrp: str = 'bc') -> str:
     return hrp + '1' + ''.join(_BECH32_CHARSET[d] for d in combined)
 
 
+def _tagged_hash(tag: str, msg: bytes) -> bytes:
+    """BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg)."""
+    tag_hash = hashlib.sha256(tag.encode()).digest()
+    return hashlib.sha256(tag_hash + tag_hash + msg).digest()
+
+
 def generate_bitcoin_addresses(num_addresses=1):
     # One random key maps to several address formats, and the target list mixes
     # them, so we derive and check every single-key type: legacy P2PKH "1..."
-    # (compressed and uncompressed keys), nested SegWit P2SH-P2WPKH "3...", and
-    # native SegWit v0 P2WPKH "bc1q...". Multisig P2SH and P2WSH come from
-    # scripts, not a single key; taproot "bc1p" is single-key-derivable but
-    # omitted for now.
+    # (compressed and uncompressed keys), nested SegWit P2SH-P2WPKH "3...",
+    # native SegWit v0 P2WPKH "bc1q...", and Taproot key-path P2TR "bc1p...".
+    # Multisig P2SH and P2WSH come from scripts, not a single key.
     addresses = []
     for _ in range(num_addresses):
         private_key = os.urandom(32)
@@ -159,6 +164,16 @@ def generate_bitcoin_addresses(num_addresses=1):
         addresses.append((private_key_hex, _b58check(b'\x05' + _hash160(b'\x00\x14' + h160_compressed))))
         # P2WPKH "bc1q...": native SegWit v0
         addresses.append((private_key_hex, _segwit_address(0, h160_compressed)))
+        # P2TR "bc1p...": Taproot key-path output (BIP341). The output key is the
+        # x-only internal key tweaked by t = H_TapTweak(x); with no script tree
+        # the tweak commits to the key alone. Encoded as SegWit v1 (bech32m).
+        internal_xonly = pk.format(compressed=True)[1:]
+        tweak = _tagged_hash('TapTweak', internal_xonly)
+        output_key = PublicKey.combine_keys([
+            PublicKey(b'\x02' + internal_xonly),  # even-Y lift of the internal key
+            PublicKey.from_valid_secret(tweak),   # t*G
+        ])
+        addresses.append((private_key_hex, _segwit_address(1, output_key.format(compressed=True)[1:])))
 
     return addresses if num_addresses > 1 else addresses[0]
 
