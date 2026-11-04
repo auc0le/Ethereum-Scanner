@@ -8,6 +8,8 @@ This project is a proof-of-concept security scanner for Ethereum addresses. It d
 
 ## Features
 
+- Supports both **Ethereum** and **Bitcoin** address generation (`--crypto`)
+- In Bitcoin target mode, derives and checks **every single-key address type** per random key — legacy, nested SegWit, native SegWit, and Taproot (see [Address Coverage](#address-coverage))
 - Multiple modes of operation: Infura, Etherscan, Alchemy, and Target
 - Multi-processing support for improved performance in Target mode
 - Colorized console output for better readability
@@ -73,6 +75,30 @@ The --target-file argument is optional and only applicable in target mode.  It a
 4. Target Mode: Reads target addresses from target.csv and attempts to find collisions by generating random addresses.
 
    ```python CPU-Windows.py target --processes 4```
+
+## Address Coverage
+
+A single private key can be encoded as several different public addresses, and the target lists mix those formats. **Target mode therefore derives and checks every address type a single key can produce**, rather than only one canonical form per key — so a key is counted as a hit if *any* of its representations appears in the target list.
+
+### Ethereum (`--crypto ethereum`, the default)
+
+One address per key: the last 20 bytes of the Keccak-256 hash of the uncompressed public key, rendered as `0x...` lowercase hex. Matching is case-insensitive, so EIP-55 mixed-case checksummed targets are still matched correctly.
+
+### Bitcoin (`--crypto bitcoin`)
+
+Five addresses per key, covering every single-key (non-script) output type:
+
+| Type | Prefix | Encoding | Notes |
+|------|--------|----------|-------|
+| P2PKH (compressed) | `1...` | Base58Check | Legacy, from the compressed public key |
+| P2PKH (uncompressed) | `1...` | Base58Check | Legacy, from the uncompressed public key |
+| P2SH-P2WPKH | `3...` | Base58Check | Nested ("wrapped") SegWit |
+| P2WPKH | `bc1q...` | bech32 | Native SegWit v0 |
+| P2TR | `bc1p...` | bech32m | Taproot key-path output (BIP341) |
+
+Base58 and bech32/bech32m are case-sensitive, so Bitcoin targets are matched with their original case preserved (unlike Ethereum, which is lowercased).
+
+**Out of scope:** multisig and other script-derived outputs (e.g. P2SH / P2WSH redeem scripts) are *not* generated. They are defined by a script rather than a single key and so cannot be produced from one random private key.
 
 ## Configuration
 
